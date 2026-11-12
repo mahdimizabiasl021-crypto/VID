@@ -31,13 +31,13 @@ MAX_BYTES = int(os.environ.get("MAX_MB", "1900")) * 1024 * 1024  # MTProto bot l
 MAX_HEIGHT = int(os.environ.get("MAX_HEIGHT", "720"))  # keeps files/time reasonable on Render
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-MEDIA_RE = re.compile(r"""https?://[^"'\s<>\\]+?\.(?:mp4|m3u8|webm|mkv)(?:\?[^"'\s<>\\]*)?""", re.I)
+MEDIA_RE = re.compile(r"""https?://[^"'\s<>\\]+?\.(?:mp4|m3u8|webm|mkv)(?![\w.\-/])(?:\?[^"'\s<>\\]*)?""", re.I)
 IFRAME_RE = re.compile(r"""<iframe[^>]+src=["']([^"']+)["']""", re.I)
 URL_RE = re.compile(r"https?://\S+")
 
 
 # ---------- finding & downloading ----------
-SRC_RE = re.compile(r"""(?:<(?:video|source)[^>]+src|og:video(?::url|:secure_url)?["'][^>]+content|href|data-src|data-video|file|src)\s*[=:]\s*["']([^"']+?\.(?:mp4|m3u8|webm|mkv)(?:\?[^"']*)?)["']""", re.I)
+SRC_RE = re.compile(r"""(?:<(?:video|source)[^>]+src|og:video(?::url|:secure_url)?["'][^>]+content|href|data-src|data-video|file|src)\s*[=:]\s*["']([^"']+?\.(?:mp4|m3u8|webm|mkv)(?![\w.\-/])(?:\?[^"']*)?)["']""", re.I)
 
 
 def fetch(url, referer=None):
@@ -72,30 +72,42 @@ def find_media(page_url, notes):
         if u not in seen:
             seen.add(u)
             out.append(u)
-    return sorted(out, key=lambda x: ".m3u8" in x)  # plain mp4 first (fast, no ffmpeg)
+    host = urlparse(page_url).netloc
+    return sorted(out, key=lambda x: (".m3u8" in x, urlparse(x).netloc == host))
 
 
 def direct_download(url, referer, outdir):
     p = urlparse(referer)
-    headers = {
-        "User-Agent": UA, "Referer": referer, "Origin": f"{p.scheme}://{p.netloc}",
-        "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
-    }
+    root = f"{p.scheme}://{p.netloc}/"
+    base = {"User-Agent": UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}
+    variants = [
+        {**base, "Referer": referer, "Origin": root.rstrip("/")},
+        {**base, "Referer": root, "Range": "bytes=0-"},
+        {**base, "Referer": referer, "Range": "bytes=0-"},
+        {**base},
+    ]
     path = os.path.join(outdir, "video.mp4")
-    with requests.get(url, headers=headers, stream=True, timeout=30) as r:
-        r.raise_for_status()
-        if "text/html" in r.headers.get("content-type", ""):
-            raise RuntimeError("سرور به‌جای ویدیو صفحه HTML داد")
-        if int(r.headers.get("content-length") or 0) > MAX_BYTES:
-            raise RuntimeError("حجم فایل از حد مجاز بیشتره")
-        written = 0
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(1 << 20):
-                f.write(chunk)
-                written += len(chunk)
-                if written > MAX_BYTES:
+    last = None
+    for headers in variants:
+        try:
+            with requests.get(url, headers=headers, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                if "text/html" in r.headers.get("content-type", ""):
+                    raise RuntimeError("سرور به‌جای ویدیو صفحه HTML داد")
+                total = int(r.headers.get("content-length") or 0)
+                if total > MAX_BYTES:
                     raise RuntimeError("حجم فایل از حد مجاز بیشتره")
-    return path
+                written = 0
+                with open(path, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        f.write(chunk)
+                        written += len(chunk)
+                        if written > MAX_BYTES:
+                            raise RuntimeError("حجم فایل از حد مجاز بیشتره")
+            return path
+        except Exception as e:
+            last = e
+    raise last
 
 
 def ytdlp(url, outdir, referer=None):
@@ -205,6 +217,15 @@ async def handle(event):
     try:
         path, notes, cands = await asyncio.to_thread(download, m.group(0), tmp)
         if not path:
+            # last resort: let Telegram's own servers fetch the URL (works if only our IP is blocked; ~20MB limit)
+            for u in [c for c in cands if ".m3u8" not in c][:2]:
+                try:
+                    await status.edit("⏳ دانلود از سرور ما نشد، تلاش از طریق خود تلگرام...")
+                    await client.send_file(event.chat_id, u, supports_streaming=True)
+                    await status.delete()
+                    return
+                except Exception as e:
+                    notes.append(f"تلگرام: {str(e)[:80]}")
             msg = "❌ دانلود نشد."
             if notes:
                 msg += "\n\nدلیل:\n" + "\n".join(notes[-3:])
