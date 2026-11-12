@@ -4,13 +4,14 @@ import glob
 import json
 import time
 import shutil
+import html as html_mod
 import asyncio
 import logging
 import tempfile
 import threading
 import subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from yt_dlp import YoutubeDL
@@ -36,34 +37,65 @@ URL_RE = re.compile(r"https?://\S+")
 
 
 # ---------- finding & downloading ----------
+SRC_RE = re.compile(r"""(?:<(?:video|source)[^>]+src|og:video(?::url|:secure_url)?["'][^>]+content|href|data-src|data-video|file|src)\s*[=:]\s*["']([^"']+?\.(?:mp4|m3u8|webm|mkv)(?:\?[^"']*)?)["']""", re.I)
+
+
 def fetch(url, referer=None):
-    h = {"User-Agent": UA}
+    h = {"User-Agent": UA, "Accept": "text/html,*/*", "Accept-Language": "en-US,en;q=0.9,fa;q=0.8"}
     if referer:
         h["Referer"] = referer
-    r = requests.get(url, headers=h, timeout=20)
+    r = requests.get(url, headers=h, timeout=25)
     r.raise_for_status()
-    return r.text.replace("\\/", "/")
+    return html_mod.unescape(r.text.replace("\\/", "/"))
 
 
-def find_media(page_url):
+def find_media(page_url, notes):
     found = []
     try:
         html = fetch(page_url)
     except Exception as e:
-        log.warning("fetch failed: %s", e)
+        notes.append(f"باز کردن صفحه: {str(e)[:120]}")
         return found
     found += MEDIA_RE.findall(html)
+    found += [urljoin(page_url, u) for u in SRC_RE.findall(html)]
     for src in IFRAME_RE.findall(html)[:5]:
         try:
-            found += MEDIA_RE.findall(fetch(urljoin(page_url, src), referer=page_url))
+            iframe_url = urljoin(page_url, src)
+            ih = fetch(iframe_url, referer=page_url)
+            found += MEDIA_RE.findall(ih)
+            found += [urljoin(iframe_url, u) for u in SRC_RE.findall(ih)]
         except Exception:
             pass
     seen, out = set(), []
-    for u in sorted(found, key=lambda x: ".m3u8" not in x):
+    for u in found:
+        u = u.strip()
         if u not in seen:
             seen.add(u)
             out.append(u)
-    return out
+    return sorted(out, key=lambda x: ".m3u8" in x)  # plain mp4 first (fast, no ffmpeg)
+
+
+def direct_download(url, referer, outdir):
+    p = urlparse(referer)
+    headers = {
+        "User-Agent": UA, "Referer": referer, "Origin": f"{p.scheme}://{p.netloc}",
+        "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
+    }
+    path = os.path.join(outdir, "video.mp4")
+    with requests.get(url, headers=headers, stream=True, timeout=30) as r:
+        r.raise_for_status()
+        if "text/html" in r.headers.get("content-type", ""):
+            raise RuntimeError("سرور به‌جای ویدیو صفحه HTML داد")
+        if int(r.headers.get("content-length") or 0) > MAX_BYTES:
+            raise RuntimeError("حجم فایل از حد مجاز بیشتره")
+        written = 0
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+                written += len(chunk)
+                if written > MAX_BYTES:
+                    raise RuntimeError("حجم فایل از حد مجاز بیشتره")
+    return path
 
 
 def ytdlp(url, outdir, referer=None):
@@ -75,34 +107,48 @@ def ytdlp(url, outdir, referer=None):
         "merge_output_format": "mp4",
         "http_headers": {"User-Agent": UA, **({"Referer": referer} if referer else {})},
     }
+    err = None
     for fmt in (f"bv*[height<={MAX_HEIGHT}]+ba/b[height<={MAX_HEIGHT}]", "best"):
         try:
             with YoutubeDL({**base, "format": fmt}) as ydl:
                 ydl.download([url])
+            err = None
             break
         except Exception as e:
             err = e
-    else:
+    if err:
         raise err
     files = [f for f in glob.glob(os.path.join(outdir, "*")) if not f.endswith((".part", ".ytdl"))]
     return files[0] if files else None
 
 
 def download(page_url, outdir):
+    """returns (path or None, notes, candidates)"""
+    notes = []
+    cands = find_media(page_url, notes)
+    log.info("candidates: %s", cands)
+    for media in cands[:6]:
+        short = media[:60]
+        try:
+            if ".m3u8" in media:
+                f = ytdlp(media, outdir, referer=page_url)
+            else:
+                try:
+                    f = direct_download(media, page_url, outdir)
+                except Exception as e1:
+                    notes.append(f"مستقیم: {str(e1)[:100]}")
+                    f = ytdlp(media, outdir, referer=page_url)
+            if f:
+                return f, notes, cands
+        except Exception as e:
+            notes.append(f"{short}: {str(e)[:100]}")
     try:
         f = ytdlp(page_url, outdir)
         if f:
-            return f
+            return f, notes, cands
     except Exception as e:
-        log.info("yt-dlp on page failed: %s", e)
-    for media in find_media(page_url)[:6]:
-        try:
-            f = ytdlp(media, outdir, referer=page_url)
-            if f:
-                return f
-        except Exception as e:
-            log.info("candidate failed %s: %s", media, e)
-    return None
+        notes.append(f"yt-dlp: {str(e)[:100]}")
+    return None, notes, cands
 
 
 def probe(path, outdir):
@@ -157,9 +203,14 @@ async def handle(event):
     status = await event.reply("⏳ در حال دانلود...")
     tmp = tempfile.mkdtemp()
     try:
-        path = await asyncio.to_thread(download, m.group(0), tmp)
+        path, notes, cands = await asyncio.to_thread(download, m.group(0), tmp)
         if not path:
-            await status.edit("❌ ویدیویی پیدا نشد یا حجمش از حد مجاز بیشتره.")
+            msg = "❌ دانلود نشد."
+            if notes:
+                msg += "\n\nدلیل:\n" + "\n".join(notes[-3:])
+            if cands:
+                msg += f"\n\n🔗 لینک پیدا‌شده:\n{cands[0]}"
+            await status.edit(msg[:3500], link_preview=False)
             return
         size = os.path.getsize(path)
         if size > MAX_BYTES:
